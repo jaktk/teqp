@@ -4,12 +4,15 @@
 #include "teqp/exceptions.hpp"
 #include "teqp/models/multifluid.hpp"
 #include "teqp/models/saftvrmie.hpp"
+#include "teqp/models/saftvrqmie.hpp"
+
+#include <variant>
 
 namespace teqp::multifluid::multifluid_excess {
 
 /**
- A multifluid model plus the residual excess of a SAFT-VR Mie model at the same temperature and
- molar density:
+ A multifluid model plus the residual excess of a SAFT-VR Mie or SAFT-VRQ Mie model at the same
+ temperature and molar density:
  
  \f[
  \alpha^{\rm r}(T,\rho,\vec{x}) = \alpha^{\rm r}_{\rm MF}(T,\rho,\vec{x}) + \Delta(T,\rho,\vec{x}),\qquad
@@ -19,32 +22,37 @@ namespace teqp::multifluid::multifluid_excess {
  with \f$\vec{e}_i\f$ the pure fluid i. \f$\Delta\f$ is zero for every pure fluid, so the pure-fluid
  limits are those of the multifluid model. The multifluid part may carry its own departure function.
  
- Each pure term is evaluated at the mixture's density, so every component's SAFT-VR Mie
+ Each pure term is evaluated at the mixture's density, so every component's excess-model
  \f$\alpha^{\rm r}\f$ must be finite at that density; where one is not (packing fraction at or above
  1 for the larger molecule of a size-asymmetric pair at very high density), \f$\alpha^{\rm r}\f$ is NaN,
- also at the pure limits. One evaluation costs N+1 SAFT-VR Mie evaluations.
+ also at the pure limits. One evaluation costs N+1 excess-model evaluations.
  
  The gas constant is the multifluid's R(x), so the pure-fluid pressures are those of the multifluid
- model. SAFT-VR Mie's \f$\alpha^{\rm r}\f$ does not depend on R, so the sum is consistent.
+ model. Neither excess model's \f$\alpha^{\rm r}\f$ depends on R, so the sum is consistent.
  
- JSON: {"multifluid": <a "multifluid" model block>, "excess": {"kind": "SAFT-VR-Mie", "model": <a
- "SAFT-VR-Mie" model block>}}. The constructor checks that both blocks have the same number of
+ JSON: {"multifluid": <a "multifluid" model block>, "excess": {"kind": <kind>, "model": <a model block
+ of that kind>}}, with kind "SAFT-VR-Mie" or "SAFT-VRQ-Mie" (Feynman-Hibbs corrected SAFT-VR Mie, for
+ quantum fluids). The constructor checks that both blocks have the same number of
  components; the caller must give the components in the same order in both blocks (multifluid
  component entries may be file paths or JSON, so names cannot be compared in general).
  */
 class MultifluidPlusExcess{
 public:
     using multifluid_t = decltype(multifluidfactory(nlohmann::json{}));
-    using excess_t = SAFTVRMie::SAFTVRMieMixture;
+    using excess_t = std::variant<SAFTVRMie::SAFTVRMieMixture, SAFTVRQMie::SAFTVRQMieMixture>;
 private:
     const multifluid_t m_multifluid;
     const excess_t m_excess;
     
     static excess_t build_excess(const nlohmann::json& spec){
-        if (spec.at("kind") != "SAFT-VR-Mie"){
-            throw teqp::InvalidArgument("multifluid-excess: the excess model must be of kind SAFT-VR-Mie, got " + spec.at("kind").dump());
+        const auto& kind = spec.at("kind");
+        if (kind == "SAFT-VR-Mie"){
+            return SAFTVRMie::SAFTVRMiefactory(spec.at("model"));
         }
-        return SAFTVRMie::SAFTVRMiefactory(spec.at("model"));
+        if (kind == "SAFT-VRQ-Mie"){
+            return SAFTVRQMie::SAFTVRQMiefactory(spec.at("model"));
+        }
+        throw teqp::InvalidArgument("multifluid-excess: the excess model must be of kind SAFT-VR-Mie or SAFT-VRQ-Mie, got " + kind.dump());
     }
 public:
     MultifluidPlusExcess(const nlohmann::json& spec) :
@@ -52,7 +60,7 @@ public:
         m_excess(build_excess(spec.at("excess")))
     {
         auto N_MF = static_cast<std::size_t>(m_multifluid.redfunc.Tc.size());
-        auto N_M = m_excess.get_names().size();
+        auto N_M = std::visit([](const auto& m){ return m.get_names().size(); }, m_excess);
         if (N_MF != N_M){
             throw teqp::InvalidArgument("multifluid-excess: the multifluid model has " + std::to_string(N_MF)
                 + " components and the excess model " + std::to_string(N_M));
@@ -67,18 +75,20 @@ public:
         return m_multifluid.R(molefrac);
     }
     
-    /// \f$\Delta(T,\rho,\vec{x})\f$, the residual excess of the SAFT-VR Mie model at the same (T, rho)
+    /// \f$\Delta(T,\rho,\vec{x})\f$, the residual excess of the excess model at the same (T, rho)
     template <typename TType, typename RhoType, typename MoleFractions>
     auto alphar_excess(const TType& T, const RhoType& rho, const MoleFractions& molefrac) const {
         using result_t = std::common_type_t<TType, RhoType, std::decay_t<decltype(molefrac[0])>>;
         const auto N = static_cast<Eigen::Index>(molefrac.size());
-        result_t val = m_excess.alphar(T, rho, molefrac);
-        Eigen::ArrayXd e = Eigen::ArrayXd::Zero(N);
-        for (Eigen::Index i = 0; i < N; ++i){
-            e.setZero(); e[i] = 1.0;
-            val -= molefrac[i]*m_excess.alphar(T, rho, e);
-        }
-        return forceeval(val);
+        return std::visit([&](const auto& model) -> result_t {
+            result_t val = model.alphar(T, rho, molefrac);
+            Eigen::ArrayXd e = Eigen::ArrayXd::Zero(N);
+            for (Eigen::Index i = 0; i < N; ++i){
+                e.setZero(); e[i] = 1.0;
+                val -= molefrac[i]*model.alphar(T, rho, e);
+            }
+            return forceeval(val);
+        }, m_excess);
     }
     
     template <typename TType, typename RhoType, typename MoleFractions>
