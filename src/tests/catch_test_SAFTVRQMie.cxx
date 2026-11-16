@@ -147,3 +147,55 @@ TEST_CASE("SAFT-VRQ Mie temperature quantities at high T against thermopack", "[
         CHECK(q.d < q.sigma_eff);
     }
 }
+
+TEST_CASE("SAFT-VRQ Mie temperature quantities reject T <= 0", "[SAFTVRQMie]"){
+    auto P = pairs_of(REF()["systems"][0]);
+    CHECK_THROWS_AS(temperature_quantities(P[0][0], 0.0), teqp::InvalidArgument);
+    CHECK_THROWS_AS(temperature_quantities(P[0][0], -5.0), teqp::InvalidArgument);
+}
+
+TEST_CASE("SAFT-VRQ Mie alphar against thermopack", "[SAFTVRQMie]"){
+    // thermopack splits alphar into "hs" (a_HS) and "disp" (a1/T + a2/T^2 + a3/T^3)
+    for (const auto& sys : REF()["systems"]){
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        Eigen::ArrayXd x = Eigen::Map<const Eigen::ArrayXd>(sys["x"].get<std::vector<double>>().data(), sys["x"].size());
+        for (const auto& tb : sys["temperatures"]){
+            double T = tb["T"];
+            for (const auto& st : tb["states"]){
+                double rho = st["rho_mol_m3"];
+                CAPTURE(sys["name"].get<std::string>(), sys["feynman_hibbs_order"].get<int>(), T, rho);
+                auto [ahs, a1, a2, a3, alphar] = model.alphar_terms(T, rho, x);
+                CHECK(ahs == Approx(st["terms"]["hs"]["a"].get<double>()).epsilon(1e-12));
+                CHECK(a1/T + a2/(T*T) + a3/(T*T*T) == Approx(st["terms"]["disp"]["a"].get<double>()).epsilon(1e-12));
+                CHECK(alphar == model.alphar(T, rho, x));
+                CHECK(model.alphar(T, rho, x) == Approx(st["alphar"].get<double>()).epsilon(1e-12));
+            }
+        }
+    }
+}
+
+TEST_CASE("SAFT-VRQ Mie third T derivative: multicomplex equals autodiff", "[SAFTVRQMie]"){
+    // get_Ar30 with multicomplex evaluates at multicomplex order 4. With the hard-sphere sums in metres
+    // 1/(6 d3na^2) is NaN there at all six states; in angstrom the largest deviation is 1.6e-13 (He FH2, 20 K, 1000 mol/m^3).
+    struct Row{ const char* name; int fh; double T, rho; };
+    const std::vector<Row> rows = {
+        {"He", 2, 5.0, 30000.0}, {"He", 2, 5.0, 1000.0}, {"He", 2, 20.0, 30000.0}, {"He", 2, 20.0, 1000.0},
+        {"He-Ne x_He=0.5", 1, 30.0, 30000.0}, {"He-Ne x_He=0.5", 1, 30.0, 1000.0},
+    };
+    for (const auto& row : rows){
+        const nlohmann::json* sys = nullptr;
+        for (const auto& s : REF()["systems"]){
+            if (s["name"] == row.name && s["feynman_hibbs_order"] == row.fh){ sys = &s; }
+        }
+        REQUIRE(sys != nullptr);
+        const auto model = SAFTVRQMiefactory(model_spec(*sys));
+        using tdx = TDXDerivatives<decltype(model)>;
+        Eigen::ArrayXd x = Eigen::Map<const Eigen::ArrayXd>((*sys)["x"].get<std::vector<double>>().data(), (*sys)["x"].size());
+        CAPTURE(row.name, row.fh, row.T, row.rho);
+        double Ar30_mcx = tdx::get_Ar30<ADBackends::multicomplex>(model, row.T, row.rho, x);
+        double Ar30_ad = tdx::get_Ar30<ADBackends::autodiff>(model, row.T, row.rho, x);
+        CAPTURE(Ar30_mcx, Ar30_ad);
+        REQUIRE(std::isfinite(Ar30_mcx));
+        CHECK(Ar30_mcx == Approx(Ar30_ad).epsilon(1e-12));
+    }
+}
