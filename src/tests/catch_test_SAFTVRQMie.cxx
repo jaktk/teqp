@@ -482,3 +482,25 @@ TEST_CASE("SAFT-VRQ Mie composition derivatives", "[SAFTVRQMie]"){
         CHECK(std::abs(lnphi[1] - row.lnphi1) < 1e-12);
     }
 }
+
+TEST_CASE("SAFT-VRQ Mie through the abstract interface", "[SAFTVRQMie]"){
+    for (const auto& sys : REF()["systems"]){
+        CAPTURE(std::string(sys["name"]), int(sys["feynman_hibbs_order"]));
+        const auto spec = model_spec(sys);
+        const auto direct = SAFTVRQMiefactory(spec);
+        auto am = cppinterface::make_model({{"kind", "SAFT-VRQ-Mie"}, {"model", spec}});
+        const auto z = molefrac_of(sys);
+        const double T = 60.0, rho = 2000.0;
+        CHECK(am->get_Ar00(T, rho, z) == direct.alphar(T, rho, z));
+        CHECK(am->get_Ar01(T, rho, z) == Approx(TDXDerivatives<decltype(direct)>::get_Ar01(direct, T, rho, z)).epsilon(1e-14));
+        CHECK(am->get_Ar10(T, rho, z) == Approx(TDXDerivatives<decltype(direct)>::get_Ar10(direct, T, rho, z)).epsilon(1e-14));
+    }
+    // the validation of the direct factory is reached through the abstract interface and keeps its type
+    auto spec = model_spec(ref_system("He", 1));
+    auto bad_order = spec; bad_order["feynman_hibbs_order"] = 3;
+    CHECK_THROWS_AS(cppinterface::make_model({{"kind", "SAFT-VRQ-Mie"}, {"model", bad_order}}), teqp::InvalidArgument);
+    auto chain = spec; chain["coeffs"][0]["m"] = 2.0;
+    CHECK_THROWS_AS(cppinterface::make_model({{"kind", "SAFT-VRQ-Mie"}, {"model", chain}}), teqp::InvalidArgument);
+    auto missing = spec; missing["coeffs"][0].erase("mass_kg");
+    CHECK_THROWS(cppinterface::make_model({{"kind", "SAFT-VRQ-Mie"}, {"model", missing}}));
+}

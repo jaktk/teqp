@@ -12,6 +12,7 @@ namespace teqp {
     namespace cppinterface {
 
         std::unique_ptr<teqp::cppinterface::AbstractModel> make_SAFTVRMie(const nlohmann::json &);
+        std::unique_ptr<teqp::cppinterface::AbstractModel> make_SAFTVRQMie(const nlohmann::json &);
         std::unique_ptr<teqp::cppinterface::AbstractModel> make_PCSAFT(const nlohmann::json &);
         std::unique_ptr<teqp::cppinterface::AbstractModel> make_PCSAFTPureGrossSadowski2001(const nlohmann::json &);
         std::unique_ptr<teqp::cppinterface::AbstractModel> make_SOFTSAFT(const nlohmann::json &);
@@ -66,6 +67,7 @@ namespace teqp {
             // use. Having all the template instantations in one file is handy, but requires a huge amount of RAM
             // ---------
             {"SAFT-VR-Mie", [](const nlohmann::json& spec){ return make_SAFTVRMie(spec); }},
+            {"SAFT-VRQ-Mie", [](const nlohmann::json& spec){ return make_SAFTVRQMie(spec); }},
             
             {"PCSAFT", [](const nlohmann::json& spec){ return make_PCSAFT(spec); }},
             {"PCSAFTPureGrossSadowski2001", [](const nlohmann::json& spec){ return make_PCSAFTPureGrossSadowski2001(spec); }},
