@@ -69,3 +69,41 @@ TEST_CASE("SAFT-VRQ Mie combining rules", "[SAFTVRQMie]"){
     CHECK(pl.eps == Approx(15.023426369209208).epsilon(1e-14));
     CHECK_THROWS_AS(make_pair(PureParameters{"X", 3e-10, 10.0, 6.0, 12.0, 1e-26}, PureParameters{"X", 3e-10, 10.0, 6.0, 12.0, 1e-26}, 0.0, 0.0, 3, 6.6e-34), teqp::InvalidArgument);
 }
+
+/// The pairs of one reference system, built from its JSON as the model will build them
+static std::vector<std::vector<PairParameters>> pairs_of(const nlohmann::json& sys){
+    auto spec = model_spec(sys);
+    auto N = sys["components"].size();
+    std::vector<std::vector<PairParameters>> P(N, std::vector<PairParameters>(N));
+    for (auto i = 0U; i < N; ++i){
+        for (auto j = 0U; j < N; ++j){
+            const auto& ci = spec["coeffs"][i]; const auto& cj = spec["coeffs"][j];
+            PureParameters a{ci["name"], ci["sigma_m"], ci["epsilon_over_k"], ci["lambda_a"], ci["lambda_r"], ci["mass_kg"]};
+            PureParameters b{cj["name"], cj["sigma_m"], cj["epsilon_over_k"], cj["lambda_a"], cj["lambda_r"], cj["mass_kg"]};
+            double kij = (i == j) ? 0.0 : spec["kmat"][i][j].get<double>();
+            double lij = (i == j) ? 0.0 : spec["lmat"][i][j].get<double>();
+            P[i][j] = make_pair(a, b, kij, lij, spec["feynman_hibbs_order"], spec["Planck_constant / J s"]);
+        }
+    }
+    return P;
+}
+
+TEST_CASE("SAFT-VRQ Mie temperature quantities against thermopack", "[SAFTVRQMie]"){
+    for (const auto& sys : REF()["systems"]){
+        auto P = pairs_of(sys);
+        for (const auto& tb : sys["temperatures"]){
+            double T = tb["T"];
+            for (auto i = 0U; i < P.size(); ++i){
+                for (auto j = 0U; j < P.size(); ++j){
+                    CAPTURE(sys["name"].get<std::string>(), sys["feynman_hibbs_order"].get<int>(), T, i, j);
+                    auto q = temperature_quantities(P[i][j], T);
+                    CHECK(q.sigma_eff == Approx(tb["sigma_eff_m"][i][j].get<double>()).epsilon(1e-12));
+                    CHECK(q.eps_eff == Approx(tb["epsilon_eff_over_k_K"][i][j].get<double>()).epsilon(1e-12));
+                    CHECK(q.d == Approx(tb["d_m"][i][j].get<double>()).epsilon(1e-12));
+                    CHECK(q.alpha == Approx(tb["alpha_vdW"][i][j].get<double>()).epsilon(1e-12));
+                    CHECK(q.d < q.sigma_eff);
+                }
+            }
+        }
+    }
+}
