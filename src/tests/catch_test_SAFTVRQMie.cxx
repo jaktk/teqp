@@ -107,3 +107,43 @@ TEST_CASE("SAFT-VRQ Mie temperature quantities against thermopack", "[SAFTVRQMie
         }
     }
 }
+
+TEST_CASE("SAFT-VRQ Mie temperature quantities at high T against thermopack", "[SAFTVRQMie]"){
+    // From 0.7 sigma_eff an unguarded Newton iteration for r0 goes to r <= 0 and diverges here (He FH1 from 199.8 K).
+    // Values: thermopack 2.2.3 (numpy 2.5.5), printed by
+    //   nice -n 19 ~/codes/teqp-dev-venv/bin/python -I ~/codes/teqp-saftvrq-ref/gen_highT_values.py
+    // {system name in the reference JSON, FH order, T / K, i, j, sigma_eff / m, eps_eff/k_B / K, d / m, alpha}
+    struct Row{ const char* name; int fh; double T; unsigned i, j; double sigma_eff, eps_eff, d, alpha; };
+    const std::vector<Row> rows = {
+        {"He", 1, 300.0, 0, 0, 2.7609445352991277e-10, 5.323834301234235, 2.1563860946291528e-10, 1.1159587559094375},
+        {"He", 1, 1000.0, 0, 0, 2.749403104276269e-10, 5.389937283581125, 1.9359459289293474e-10, 1.1222034045524532},
+        {"He-Ne x_He=0.5", 1, 1000.0, 0, 0, 2.749403104276269e-10, 5.389937283581125, 1.9359459289293474e-10, 1.1222034045524532},
+        {"He-Ne x_He=0.5", 1, 1000.0, 0, 1, 2.7644763143045584e-10, 17.322540719266495, 2.2108160093197221e-10, 0.9645700445868538},
+        {"He-Ne x_He=0.5", 1, 1000.0, 1, 0, 2.7644763143045584e-10, 17.322540719266495, 2.2108160093197221e-10, 0.9645700445868538},
+        {"He-Ne x_He=0.5", 1, 1000.0, 1, 1, 2.7790940353091995e-10, 37.44036615813248, 2.39057483255533e-10, 0.8402391220371243},
+        {"H2", 1, 1000.0, 0, 0, 3.033439995891972e-10, 26.469749268345055, 2.4419295083205345e-10, 1.120466056296066},
+        {"He", 2, 300.0, 0, 0, 2.572747556203206e-10, 10.603795402474775, 2.2102172272859436e-10, 0.8314841980018598},
+        {"He", 2, 1000.0, 0, 0, 2.5561335716719083e-10, 10.846089534928735, 2.0421398343877632e-10, 0.8379102712282138},
+        {"He-Ne x_He=0.5", 2, 1000.0, 0, 0, 2.5561335716719083e-10, 10.846089534928735, 2.0421398343877632e-10, 0.8379102712282138},
+        {"He-Ne x_He=0.5", 2, 1000.0, 0, 1, 2.6665918515618326e-10, 21.370383345083336, 2.2211711604115388e-10, 0.8391680144681761},
+        {"He-Ne x_He=0.5", 2, 1000.0, 1, 0, 2.6665918515618326e-10, 21.370383345083336, 2.2211711604115388e-10, 0.8391680144681761},
+        {"He-Ne x_He=0.5", 2, 1000.0, 1, 1, 2.777299006251868e-10, 37.654736799144, 2.3897909852382424e-10, 0.8402367541310675},
+        {"H2", 2, 1000.0, 0, 0, 2.936656788168689e-10, 54.42273677911885, 2.6730700990320927e-10, 0.6531540880146505},
+    };
+    for (const auto& row : rows){
+        const nlohmann::json* sys = nullptr;
+        for (const auto& s : REF()["systems"]){
+            if (s["name"] == row.name && s["feynman_hibbs_order"] == row.fh){ sys = &s; }
+        }
+        REQUIRE(sys != nullptr);
+        auto P = pairs_of(*sys);
+        CAPTURE(row.name, row.fh, row.T, row.i, row.j);
+        auto q = temperature_quantities(P[row.i][row.j], row.T);
+        CHECK(q.sigma_eff == Approx(row.sigma_eff).epsilon(1e-12));
+        CHECK(q.eps_eff == Approx(row.eps_eff).epsilon(1e-12));
+        CHECK(q.d == Approx(row.d).epsilon(1e-12));
+        CHECK(q.alpha == Approx(row.alpha).epsilon(1e-12));
+        CHECK(q.r0 > 0);
+        CHECK(q.d < q.sigma_eff);
+    }
+}

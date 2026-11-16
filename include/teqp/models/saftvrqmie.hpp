@@ -23,10 +23,13 @@
 #include "teqp/exceptions.hpp"
 #include "nlohmann/json.hpp"
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace teqp::SAFTVRQMie {
@@ -46,6 +49,7 @@ struct PairParameters{
     double Q1a, Q1r, Q2a, Q2r;  ///< Feynman-Hibbs coefficients Q1(lambda) = lambda(lambda-1), Q2 = 1/2 lambda(lambda-1)(lambda+1)(lambda+2)
     double Dparam;    ///< h^2/(96 mu_ij k_B pi^2), m^2 K; D_ij(T) = Dparam/T
     int fh;           ///< Feynman-Hibbs order, 1 or 2
+    std::string label;  ///< "name_i-name_j", for error messages
 };
 
 inline PairParameters make_pair(const PureParameters& pi, const PureParameters& pj, double kij, double lij, int fh, double h_Js){
@@ -54,6 +58,7 @@ inline PairParameters make_pair(const PureParameters& pi, const PureParameters& 
     }
     PairParameters p;
     p.fh = fh;
+    p.label = pi.name + "-" + pj.name;
     p.la = 3.0 + std::sqrt((pi.lambda_a - 3.0)*(pj.lambda_a - 3.0));
     p.lr = 3.0 + std::sqrt((pi.lambda_r - 3.0)*(pj.lambda_r - 3.0));
     p.sigma = 0.5*(pi.sigma_m + pj.sigma_m)*(1.0 - lij);
@@ -98,12 +103,18 @@ inline constexpr std::array<double, 21> GK21_W{
     0.075039674810919952767043140916190, 0.054755896574351996031381300244580, 0.032558162307964727478818972459390,
     0.011694638867371874278064396062192};
 
-/// u_ij(r)/k_B in K and its first two derivatives in r, Part II Eq. 1 (thermopack saftvrmie_hardsphere.f90:1189-1387)
+/// Lengths inside the pair potential and its roots are in angstrom: in metres r^6 is ~1e-57, and the
+/// recursive-squaring inverse of multicomplex numbers (MultiComplex.hpp:545-554) underflows at order >= 3.
+/// The classical model does the same (saftvrmie.hpp: sigma_A = sigma_m*1e10).
+inline constexpr double M_TO_A = 1e10;
+
+/// u_ij(r)/k_B in K and its first two derivatives in r, Part II Eq. 1 (thermopack saftvrmie_hardsphere.f90:1189-1387).
+/// r in angstrom, D in angstrom^2 (D = 1e20*Dparam/T); U1 in K/angstrom, U2 in K/angstrom^2.
 template<typename RType, typename DType>
 auto pair_potential(const PairParameters& p, const RType& r, const DType& D){
     using num = std::common_type_t<RType, DType>;
-    const double la = p.la, lr = p.lr;
-    num a = pow(p.sigma/r, la), b = pow(p.sigma/r, lr);
+    const double la = p.la, lr = p.lr, s = p.sigma*M_TO_A;
+    num a = pow(s/r, la), b = pow(s/r, lr);
     num U = b - a;
     num U1 = (-lr*b + la*a)/r;
     num U2 = (lr*(lr + 1.0)*b - la*(la + 1.0)*a)/(r*r);
@@ -121,34 +132,48 @@ auto pair_potential(const PairParameters& p, const RType& r, const DType& D){
     return std::make_tuple(num(f*U), num(f*U1), num(f*U2));
 }
 
-/// Newton on g(r) = 0 from r_start: converged in double (T at its base value), then N_AD steps in the
-/// type of T, which make the root's derivatives in T exact to order 2^N_AD - 1
+/// Newton on g(r) = 0 from r_start > 0: converged in double (T at its base value), then N_AD steps in the
+/// type of T, which make the root's derivatives in T exact to order 2^N_AD - 1.
+///
+/// The double stage never steps below half the current iterate. For r0 the function u/T + ln(eps_mach) is
+/// convex and decreasing, and from 0.7 sigma_eff the first plain Newton step overshoots: below r/2 for He FH1
+/// from 111 K, and to r <= 0 with a diverging iteration from 199.8 K. Once an iterate is left of the root, Newton on a convex decreasing function (r0, sigma_eff)
+/// or a concave increasing one (du/dr for r_min) climbs monotonically to it, so the guard acts at most on
+/// the first steps and the iterate stays positive. A non-finite iterate throws.
 template<typename TType, typename G>
-TType newton_root(const G& g, double r_start, const TType& T){
+TType newton_root(const G& g, double r_start, const TType& T, const char* root, const PairParameters& p){
     constexpr int N_AD = 3;
     const double Tb = getbaseval(T);
     double r = r_start;
     bool converged = false;
     for (int it = 0; it < 100; ++it){
         auto [val, der] = g(r, Tb);
-        double dr = -val/der;
-        r += dr;
+        double r_new = std::max(r - val/der, 0.5*r);
+        double dr = r_new - r;
+        r = r_new;
+        if (!std::isfinite(r)){ break; }
         if (std::abs(dr) <= 4*std::numeric_limits<double>::epsilon()*std::abs(r)){ converged = true; break; }
     }
     if (!converged){
-        throw teqp::IterationError("SAFT-VRQ Mie: a Newton root did not converge in 100 steps");
+        throw teqp::IterationError("SAFT-VRQ Mie: the Newton iteration for " + std::string(root) + " of pair " + p.label
+                                   + " did not converge at T = " + std::to_string(Tb) + " K");
     }
-    TType rT = r;
-    for (int k = 0; k < N_AD; ++k){
-        auto [val, der] = g(rT, T);
-        rT = rT - val/der;
+    if constexpr (std::is_same_v<std::decay_t<TType>, double>){
+        return r;
     }
-    return rT;
+    else{
+        TType rT = r;
+        for (int k = 0; k < N_AD; ++k){
+            auto [val, der] = g(rT, T);
+            rT = rT - val/der;
+        }
+        return rT;
+    }
 }
 
 template<typename TType>
 struct TemperatureQuantities{
-    TType D, Dt, sigma_eff, eps_eff, r0, d, alpha;
+    TType D, Dt, sigma_eff, eps_eff, r0, d, alpha;  ///< D in m^2, sigma_eff, r0 and d in m, eps_eff in K
     std::array<TType, 6> f;
 };
 
@@ -158,28 +183,35 @@ auto temperature_quantities(const PairParameters& p, const TType& T){
     TemperatureQuantities<TType> q;
     q.D = p.Dparam/T;
     q.Dt = q.D/(p.sigma*p.sigma);
+    // in angstrom from here to the conversion back at the end
+    const double sA = p.sigma*M_TO_A;
+    const double DparamA = p.Dparam*M_TO_A*M_TO_A;
+    TType DA = q.D*(M_TO_A*M_TO_A);
     // sigma_eff: u(sigma_eff) = 0, from r = sigma
-    q.sigma_eff = newton_root([&](const auto& r, const auto& TT){
-        auto [U, U1, U2] = pair_potential(p, r, forceeval(p.Dparam/TT)); return std::make_tuple(U, U1); }, p.sigma, T);
+    TType sigma_effA = newton_root([&](const auto& r, const auto& TT){
+        auto [U, U1, U2] = pair_potential(p, r, forceeval(DparamA/TT)); return std::make_tuple(U, U1); }, sA, T, "sigma_eff", p);
     // eps_eff = -u(r_min), du/dr(r_min) = 0, from r = sigma
-    auto rmin = newton_root([&](const auto& r, const auto& TT){
-        auto [U, U1, U2] = pair_potential(p, r, forceeval(p.Dparam/TT)); return std::make_tuple(U1, U2); }, p.sigma, T);
-    q.eps_eff = -std::get<0>(pair_potential(p, rmin, q.D));
+    TType rminA = newton_root([&](const auto& r, const auto& TT){
+        auto [U, U1, U2] = pair_potential(p, r, forceeval(DparamA/TT)); return std::make_tuple(U1, U2); }, sA, T, "r_min", p);
+    q.eps_eff = -std::get<0>(pair_potential(p, rminA, DA));
     // r0: u(r0)/T = -ln(eps_mach); the integrand of d is 1 to machine precision on [0, r0]
     const double target = -std::log(std::numeric_limits<double>::epsilon());
-    q.r0 = newton_root([&](const auto& r, const auto& TT){
-        auto [U, U1, U2] = pair_potential(p, r, forceeval(p.Dparam/TT)); return std::make_tuple(forceeval(U/TT - target), forceeval(U1/TT)); }, 0.7*getbaseval(q.sigma_eff), T);
+    TType r0A = newton_root([&](const auto& r, const auto& TT){
+        auto [U, U1, U2] = pair_potential(p, r, forceeval(DparamA/TT)); return std::make_tuple(forceeval(U/TT - target), forceeval(U1/TT)); }, 0.7*getbaseval(sigma_effA), T, "r0", p);
     // d = r0 + integral_{r0}^{sigma_eff} [1 - exp(-u/T)] dr, GK21, summed in node order
-    TType half = (q.sigma_eff - q.r0)/2.0;
-    q.d = q.r0;
+    TType half = (sigma_effA - r0A)/2.0;
+    TType dA = r0A;
     for (std::size_t k = 0; k < 21; ++k){
-        TType rk = half*GK21_X[k] + half + q.r0;
-        auto U = std::get<0>(pair_potential(p, rk, q.D));
-        q.d += half*GK21_W[k]*(1.0 - exp(-U/T));
+        TType rk = half*GK21_X[k] + half + r0A;
+        auto U = std::get<0>(pair_potential(p, rk, DA));
+        dA += half*GK21_W[k]*(1.0 - exp(-U/T));
     }
+    q.sigma_eff = sigma_effA/M_TO_A;
+    q.r0 = r0A/M_TO_A;
+    q.d = dA/M_TO_A;
     // dimensionless van der Waals energy, Part I Eqs. 18-21 (thermopack calcAlpha)
     const double la = p.la, lr = p.lr;
-    TType sr = p.sigma/q.sigma_eff;
+    TType sr = sA/sigma_effA;
     TType al = pow(sr, la)/(la - 3.0) - pow(sr, lr)/(lr - 3.0);
     if (p.fh >= 1){ al += q.Dt*(p.Q1a*pow(sr, la + 2.0)/(la - 1.0) - p.Q1r*pow(sr, lr + 2.0)/(lr - 1.0)); }
     if (p.fh >= 2){ al += q.Dt*q.Dt*(p.Q2a*pow(sr, la + 4.0)/(la + 1.0) - p.Q2r*pow(sr, lr + 4.0)/(lr + 1.0)); }
