@@ -114,3 +114,40 @@ TEST_CASE("multifluid-excess: invalid specifications raise", "[multifluid-excess
                          Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("components")));
 }
 
+TEST_CASE("multifluid-excess: a VLE isotherm traces from the pure-fluid saturation state", "[multifluid-excess]"){
+    auto am = cppinterface::make_model({{"kind", "multifluid-excess"}, {"model", hybrid_spec()}});
+    auto mf = cppinterface::make_model({{"kind", "multifluid"}, {"model", hybrid_spec().at("multifluid")}});
+    const double T = 230.0;  // below Tc(ethane) 305.3 K, above Tc(methane) 190.6 K
+    Eigen::ArrayXd z1(2); z1 << 0.0, 1.0;
+    // The abstract interface has no superancillary accessor, so both models start from the same guesses
+    auto rhoLV_mf = mf->pure_VLE_T(T, 15000.0, 200.0, 50, z1);
+    auto rhoLV = am->pure_VLE_T(T, 15000.0, 200.0, 50, z1);
+    for (int i = 0; i < 2; ++i){
+        REQUIRE(std::isfinite(rhoLV_mf[i]));
+        REQUIRE(std::isfinite(rhoLV[i]));
+        CHECK(rhoLV[i] == Approx(rhoLV_mf[i]).epsilon(1e-10));
+    }
+    REQUIRE(rhoLV[0] > rhoLV[1]);
+    Eigen::ArrayXd rhovecL(2), rhovecV(2); rhovecL << 0.0, rhoLV[0]; rhovecV << 0.0, rhoLV[1];
+    TVLEOptions opt; opt.p_termination = 1e8; opt.crit_termination = 1e-4; opt.calc_criticality = true;
+    auto trace = am->trace_VLE_isotherm_binary(T, rhovecL, rhovecV, opt);
+    REQUIRE(trace.size() > 10);
+    double max_xL0 = 0.0;
+    // The multifluid's R depends on composition (methane 8.31451, ethane 8.314472). The tracer solves
+    // with R(x) of the liquid for both phases but stores pV with R(y), so pL and pV differ by up to
+    // ~3e-6 relative, in the plain multifluid as well. pL is compared with pV recomputed with R(x).
+    for (const auto& pt : trace){
+        double pL = pt.at("pL / Pa").get<double>();
+        auto rhovecLpt = pt.at("rhoL / mol/m^3").get<std::vector<double>>();
+        auto rhovecVpt = pt.at("rhoV / mol/m^3").get<std::vector<double>>();
+        Eigen::ArrayXd rL = Eigen::Map<Eigen::ArrayXd>(rhovecLpt.data(), 2);
+        Eigen::ArrayXd rV = Eigen::Map<Eigen::ArrayXd>(rhovecVpt.data(), 2);
+        double pV_RxL = rV.sum()*am->get_R((rL/rL.sum()).eval())*T + am->get_pr(T, rV);
+        CAPTURE(pL, pV_RxL);
+        CHECK(std::isfinite(pL));
+        CHECK(pL == Approx(pV_RxL).epsilon(1e-10));
+        max_xL0 = std::max(max_xL0, pt.at("xL_0 / mole frac.").get<double>());
+    }
+    CAPTURE(trace.size(), max_xL0);
+    CHECK(max_xL0 > 0.05);
+}
