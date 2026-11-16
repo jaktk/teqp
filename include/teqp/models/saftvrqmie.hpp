@@ -289,7 +289,8 @@ public:
         // m = 1: rho_s = N_A rho, here in 1/angstrom^3
         RhoType rhoN = rho*(constants::N_A/(M_TO_A*M_TO_A*M_TO_A));
         
-        // Hard spheres: Santos et al. non-additive mixture with the Carnahan-Starling pure fluid (Part II Eqs. 14-24)
+        // Hard spheres: Santos et al. non-additive mixture with the Carnahan-Starling pure fluid
+        // (Part II Eqs. 14-24)
         result_t d3na = 0.0, B2 = 0.0, B3 = 0.0;
         for (auto i = 0U; i < N; ++i){ d3na += x[i]*pow(d(i,i), 3); }
         for (auto i = 0U; i < N; ++i){ for (auto j = 0U; j < N; ++j){ B2 += 4.0*x[i]*x[j]*pow(d(i,j), 3); } }
@@ -312,6 +313,8 @@ public:
         result_t A2 = (B3 - d3na*B2)/(6.0*d3na*d3na);
         result_t eta = constants::PI/6.0*rhoN*d3na;
         result_t a_cs = (4.0*eta - 3.0*eta*eta)/((1.0 - eta)*(1.0 - eta));
+        // thermopack uses the same -log(1 - eta) form. Its relative error is ~eps_mach/eta at very low
+        // density (2.4e-8 on alphar/rho at rho = 1e-3 mol/m^3 for Ne-H2); the derivatives are not affected.
         result_t ahs = -log(1.0 - eta)*A1 + a_cs*A2;
         
         // Packing fractions of the perturbation terms
@@ -388,25 +391,62 @@ public:
 /// default CODATA 2018 6.62607015e-34; thermopack 2.2.3 uses 6.626069311e-34, which moves alphar by up to
 /// 4e-6)}
 inline auto SAFTVRQMiefactory(const nlohmann::json& spec){
-    const int fh = spec.at("feynman_hibbs_order");
+    const auto& jfh = spec.at("feynman_hibbs_order");
+    if (!jfh.is_number_integer() || (jfh.get<int>() != 1 && jfh.get<int>() != 2)){
+        throw teqp::InvalidArgument("SAFT-VRQ Mie: feynman_hibbs_order must be the integer 1 or 2, got " + jfh.dump());
+    }
+    const int fh = jfh.get<int>();
     const double h = spec.value("Planck_constant / J s", 6.62607015e-34);
+    if (!spec.at("coeffs").is_array() || spec.at("coeffs").empty()){
+        throw teqp::InvalidArgument("SAFT-VRQ Mie: coeffs must be a non-empty array");
+    }
     std::vector<PureParameters> pures;
     std::vector<std::string> names;
     for (const auto& c : spec.at("coeffs")){
+        const std::string name = c.at("name");
         if (c.contains("m") && c.at("m").get<double>() != 1.0){
-            throw teqp::InvalidArgument("SAFT-VRQ Mie is defined for spherical molecules only (m = 1)");
+            throw teqp::InvalidArgument("SAFT-VRQ Mie is defined for spherical molecules only (m = 1); " + name
+                                        + " has m = " + c.at("m").dump());
         }
-        pures.push_back(PureParameters{c.at("name"), c.at("sigma_m"), c.at("epsilon_over_k"), c.at("lambda_a"),
-                                       c.at("lambda_r"), c.at("mass_kg")});
-        names.push_back(c.at("name"));
+        PureParameters pp{name, c.at("sigma_m"), c.at("epsilon_over_k"), c.at("lambda_a"), c.at("lambda_r"),
+                          c.at("mass_kg")};
+        auto positive = [&](double v, const char* key){
+            if (!(v > 0.0)){
+                throw teqp::InvalidArgument("SAFT-VRQ Mie: " + std::string(key) + " of " + name
+                                            + " must be positive, got " + std::to_string(v));
+            }
+        };
+        positive(pp.sigma_m, "sigma_m");
+        positive(pp.epsilon_over_k, "epsilon_over_k");
+        positive(pp.mass_kg, "mass_kg");
+        if (!(pp.lambda_a > 3.0 && pp.lambda_r > pp.lambda_a)){
+            throw teqp::InvalidArgument("SAFT-VRQ Mie: " + name + " needs lambda_r > lambda_a > 3, got lambda_a = "
+                                        + std::to_string(pp.lambda_a) + ", lambda_r = " + std::to_string(pp.lambda_r));
+        }
+        pures.push_back(pp);
+        names.push_back(name);
     }
     const auto N = pures.size();
+    // pairs[i][j] and pairs[j][i] are built separately, while the temperature quantities are computed for
+    // j >= i and copied, so an asymmetric matrix would give an inconsistent model. The diagonal is not used.
     auto matrix = [&](const char* key){
         Eigen::ArrayXXd M = Eigen::ArrayXXd::Zero(N, N);
         if (spec.contains(key) && spec.at(key).size() > 0){
             M = build_square_matrix(spec.at(key));
             if (static_cast<std::size_t>(M.rows()) != N){
                 throw teqp::InvalidArgument(std::string("SAFT-VRQ Mie: ") + key + " has the wrong size");
+            }
+            for (auto i = 0U; i < N; ++i){
+                if (M(i,i) != 0.0){
+                    throw teqp::InvalidArgument(std::string("SAFT-VRQ Mie: ") + key
+                                                + " has a nonzero diagonal entry for " + names[i]);
+                }
+                for (auto j = i + 1; j < N; ++j){
+                    if (M(i,j) != M(j,i)){
+                        throw teqp::InvalidArgument(std::string("SAFT-VRQ Mie: ") + key + " is not symmetric for "
+                                                    + names[i] + "-" + names[j]);
+                    }
+                }
             }
         }
         return M;

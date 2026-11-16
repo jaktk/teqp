@@ -1,6 +1,7 @@
 #include <fstream>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 using Catch::Approx;
 
 #include "teqp/models/saftvrqmie.hpp"
@@ -198,4 +199,49 @@ TEST_CASE("SAFT-VRQ Mie third T derivative: multicomplex equals autodiff", "[SAF
         REQUIRE(std::isfinite(Ar30_mcx));
         CHECK(Ar30_mcx == Approx(Ar30_ad).epsilon(1e-12));
     }
+}
+
+TEST_CASE("SAFT-VRQ Mie factory input validation", "[SAFTVRQMie]"){
+    using Catch::Matchers::ContainsSubstring;
+    const nlohmann::json* sys = nullptr;
+    for (const auto& s : REF()["systems"]){
+        if (s["name"] == "He-Ne x_He=0.5" && s["feynman_hibbs_order"] == 1){ sys = &s; }
+    }
+    REQUIRE(sys != nullptr);
+    const nlohmann::json base = model_spec(*sys);
+    CHECK_NOTHROW(SAFTVRQMiefactory(base));
+    
+    auto with = [&](const std::string& key, const nlohmann::json& value){ auto j = base; j[key] = value; return j; };
+    // asymmetric kmat / lmat, nonzero diagonal
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("kmat", {{0.0, -0.22}, {0.0, 0.0}})), ContainsSubstring("kmat is not symmetric for HE-NE"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("lmat", {{0.0, 0.0}, {0.05, 0.0}})), ContainsSubstring("lmat is not symmetric for HE-NE"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("kmat", {{0.1, -0.22}, {-0.22, 0.0}})), ContainsSubstring("kmat has a nonzero diagonal entry for HE"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("lmat", {{0.0, 0.0}, {0.0, 0.1}})), ContainsSubstring("lmat has a nonzero diagonal entry for NE"));
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("kmat", {{0.0, -0.22}, {0.0, 0.0}})), teqp::InvalidArgument);
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("lmat", {{0.0, 0.0}, {0.0, 0.1}})), teqp::InvalidArgument);
+    
+    // Feynman-Hibbs order
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("feynman_hibbs_order", 1.7)), ContainsSubstring("feynman_hibbs_order must be the integer 1 or 2"));
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("feynman_hibbs_order", 1.0)), teqp::InvalidArgument);
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("feynman_hibbs_order", 3)), teqp::InvalidArgument);
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("feynman_hibbs_order", 0)), teqp::InvalidArgument);
+    
+    // empty coeffs
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with("coeffs", nlohmann::json::array())), ContainsSubstring("coeffs must be a non-empty array"));
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with("coeffs", nlohmann::json::array())), teqp::InvalidArgument);
+    
+    // bad pure parameters of the second component (NE)
+    auto with_pure = [&](const std::string& key, double value){ auto j = base; j["coeffs"][1][key] = value; return j; };
+    for (const char* key : {"sigma_m", "epsilon_over_k", "mass_kg"}){
+        CAPTURE(key);
+        CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure(key, 0.0)), ContainsSubstring(std::string(key) + " of NE must be positive"));
+        CHECK_THROWS_AS(SAFTVRQMiefactory(with_pure(key, -1.0)), teqp::InvalidArgument);
+    }
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("lambda_a", 3.0)), ContainsSubstring("NE needs lambda_r > lambda_a > 3"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("lambda_a", 2.5)), ContainsSubstring("NE needs lambda_r > lambda_a > 3"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("lambda_r", 6.0)), ContainsSubstring("NE needs lambda_r > lambda_a > 3"));
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("lambda_r", 5.0)), ContainsSubstring("NE needs lambda_r > lambda_a > 3"));
+    CHECK_THROWS_AS(SAFTVRQMiefactory(with_pure("lambda_r", 5.0)), teqp::InvalidArgument);
+    // m != 1
+    CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("m", 2.0)), ContainsSubstring("spherical molecules only"));
 }
