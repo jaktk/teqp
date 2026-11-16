@@ -95,6 +95,14 @@ TEST_CASE("multifluid-excess: autodiff derivatives against complex step and fini
     }
 }
 
+TEST_CASE("multifluid-excess: built by kind through the abstract interface", "[multifluid-excess]"){
+    const MultifluidPlusExcess hybrid(hybrid_spec());
+    auto am = cppinterface::make_model({{"kind", "multifluid-excess"}, {"model", hybrid_spec()}});
+    Eigen::ArrayXd z(2); z << 0.3, 0.7;
+    CHECK(am->get_Ar00(250.0, 5000.0, z) == hybrid.alphar(250.0, 5000.0, z));
+    CHECK(am->get_Ar01(250.0, 5000.0, z) == Approx(TDXDerivatives<MultifluidPlusExcess>::get_Ar01(hybrid, 250.0, 5000.0, z)).epsilon(1e-14));
+}
+
 TEST_CASE("multifluid-excess: invalid specifications raise", "[multifluid-excess]"){
     auto wrong_kind = hybrid_spec(); wrong_kind["excess"]["kind"] = "PCSAFT";
     CHECK_THROWS_AS(MultifluidPlusExcess(wrong_kind), teqp::InvalidArgument);
