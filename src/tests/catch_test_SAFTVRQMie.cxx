@@ -245,3 +245,157 @@ TEST_CASE("SAFT-VRQ Mie factory input validation", "[SAFTVRQMie]"){
     // m != 1
     CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("m", 2.0)), ContainsSubstring("spherical molecules only"));
 }
+
+/// The reference system with this name and Feynman-Hibbs order
+static const nlohmann::json& ref_system(const std::string& name, int fh){
+    for (const auto& s : REF()["systems"]){
+        if (s["name"] == name && s["feynman_hibbs_order"] == fh){ return s; }
+    }
+    throw std::invalid_argument(name);
+}
+
+static Eigen::ArrayXd molefrac_of(const nlohmann::json& sys){
+    auto x = sys["x"].get<std::vector<double>>();
+    return Eigen::Map<const Eigen::ArrayXd>(x.data(), x.size());
+}
+
+TEST_CASE("SAFT-VRQ Mie derivatives against thermopack", "[SAFTVRQMie]"){
+    for (const auto& sys : REF()["systems"]){
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        using tdx = TDXDerivatives<decltype(model)>;
+        const Eigen::ArrayXd x = molefrac_of(sys);
+        for (const auto& tb : sys["temperatures"]){
+            double T = tb["T"];
+            for (const auto& st : tb["states"]){
+                double rho = st["rho_mol_m3"];
+                CAPTURE(sys["name"].get<std::string>(), sys["feynman_hibbs_order"].get<int>(), T, rho);
+                double Ar01 = tdx::get_Ar01(model, T, rho, x), Ar10 = tdx::get_Ar10(model, T, rho, x);
+                double Ar20 = tdx::get_Ar20(model, T, rho, x), Ar11 = tdx::get_Ar11(model, T, rho, x), Ar02 = tdx::get_Ar02(model, T, rho, x);
+                CHECK(Ar01 == Approx(st["Ar01"].get<double>()).epsilon(1e-12));
+                CHECK(Ar10 == Approx(st["Ar10"].get<double>()).epsilon(1e-12));
+                // Measured largest relative differences (240 states): Ar01 1.0e-13, Ar10 2.3e-14, Ar20 3.7e-13, Ar11 5.9e-13,
+                // Ar02 3.0e-11. thermopack's second derivatives carry ~1e-10 rounding where they are small (EQUATIONS.md section 16)
+                CHECK(Ar20 == Approx(st["Ar20"].get<double>()).epsilon(1e-9).margin(1e-14));
+                CHECK(Ar11 == Approx(st["Ar11"].get<double>()).epsilon(1e-9).margin(1e-14));
+                CHECK(Ar02 == Approx(st["Ar02"].get<double>()).epsilon(1e-9).margin(1e-14));
+                // autodiff against backends that never see the Newton steps in the autodiff type.
+                // complex_step for T fails to compile for alphar-only models (derivs.hpp calls w.alpha), so T uses multicomplex.
+                // Measured: Ar01 1.4e-14, Ar10 2.4e-14.
+                double Ar01_cs = tdx::get_Ar01<ADBackends::complex_step>(model, T, rho, x);
+                double Ar10_mcx = tdx::get_Ar10<ADBackends::multicomplex>(model, T, rho, x);
+                CHECK(Ar01 == Approx(Ar01_cs).epsilon(1e-12));
+                CHECK(Ar10 == Approx(Ar10_mcx).epsilon(1e-12));
+            }
+        }
+    }
+}
+
+TEST_CASE("SAFT-VRQ Mie derivatives at high T against thermopack", "[SAFTVRQMie]"){
+    // He-Ne data reach 673 K; ref_values.json stops at 150 K. Values: thermopack 2.2.3 (numpy 2.5.5),
+    // computed as in ref_values.json and printed by
+    //   nice -n 19 ~/codes/teqp-dev-venv/bin/python -I ~/codes/teqp-saftvrq-ref/gen_highT_derivs.py
+    // {system name in the reference JSON, FH order, T / K, rho / mol/m^3, alphar, Ar01, Ar10, Ar20, Ar11, Ar02}
+    // Measured largest relative differences: alphar 2.4e-15, Ar01 2.2e-15, Ar10 2.0e-14, Ar20 3.0e-15, Ar11 3.6e-14, Ar02 5.1e-14.
+    struct Row{ const char* name; int fh; double T, rho, alphar, Ar01, Ar10, Ar20, Ar11, Ar02; };
+    const std::vector<Row> rows = {
+        {"He-Ne x_He=0.05", 1, 300.0, 1000.0, 0.012147871116139727, 0.012258919536488479, -0.005674076809995385, -0.0034738511795365783, -0.005656853337629974, 0.00022389183426253442},
+        {"He-Ne x_He=0.05", 1, 300.0, 20000.0, 0.2927906043211588, 0.3544545992001527, -0.10392539087905918, -0.08361401518917352, -0.0895037203014223, 0.14511174299504026},
+        {"He-Ne x_He=0.05", 1, 673.0, 1000.0, 0.01445755471357971, 0.014551805927743772, -0.000754790815178101, -0.00303623137266656, -0.0007310556114513007, 0.00018978651885369346},
+        {"He-Ne x_He=0.05", 1, 673.0, 20000.0, 0.3301225658297835, 0.3792393983105633, -0.003242961285683171, -0.07341795906603428, 0.01268841180602939, 0.11206914115976774},
+        {"He-Ne x_He=0.5", 1, 300.0, 1000.0, 0.012297275897347977, 0.012380573917170805, -0.001712841622357471, -0.0031278140977970006, -0.0016883907952052431, 0.00016769721616164204},
+        {"He-Ne x_He=0.5", 1, 300.0, 20000.0, 0.28201669540423746, 0.3250833533219479, -0.022348114695050155, -0.07356273940249722, -0.006590680579184896, 0.09776890447495168},
+        {"He-Ne x_He=0.5", 1, 673.0, 1000.0, 0.012490359494866382, 0.012554215248420528, 0.0008419322234044835, -0.0027288594557168355, 0.0008651455834111958, 0.0001283877768773027},
+        {"He-Ne x_He=0.5", 1, 673.0, 20000.0, 0.27670767747210806, 0.3080035037046963, 0.0274355163239626, -0.06287311475152153, 0.04064593965229366, 0.06930460329722787},
+        {"He-Ne x_He=0.05", 2, 300.0, 1000.0, 0.012075817234876806, 0.012185962952144759, -0.00574780669870147, -0.0034197953534165007, -0.005731479457568408, 0.00022206626461963516},
+        {"He-Ne x_He=0.05", 2, 300.0, 20000.0, 0.2909358191922603, 0.35209666727092703, -0.10585587880171471, -0.08222632545844677, -0.09203515571567324, 0.14398593588163722},
+        {"He-Ne x_He=0.05", 2, 673.0, 1000.0, 0.014438566719494108, 0.014532561207339324, -0.0008124839988070177, -0.0029978938879396573, -0.0007894190962166843, 0.00018926996110827862},
+        {"He-Ne x_He=0.05", 2, 673.0, 20000.0, 0.32963850864130734, 0.37864456055807266, -0.004700893148680588, -0.07254425760368453, 0.010859817971894803, 0.11186116426115478},
+        {"He-Ne x_He=0.5", 2, 300.0, 1000.0, 0.012334368728422087, 0.012416597607385699, -0.0021430334075943458, -0.0027512305925157902, -0.002124266337259261, 0.00016554058466857272},
+        {"He-Ne x_He=0.5", 2, 300.0, 20000.0, 0.28233294307070206, 0.324998621271741, -0.03354048904049931, -0.06511052316285511, -0.020928783743197208, 0.09724664560023566},
+        {"He-Ne x_He=0.5", 2, 673.0, 1000.0, 0.012848345930482147, 0.012914726021986234, 0.00048582926636946865, -0.0024877098076564476, 0.0005057998399458058, 0.0001334783967854615},
+        {"He-Ne x_He=0.5", 2, 673.0, 20000.0, 0.2850162940860574, 0.3177669771619032, 0.01895628372361786, -0.058012662248537544, 0.030629761064375063, 0.0728397763420825},
+    };
+    for (const auto& row : rows){
+        const auto& sys = ref_system(row.name, row.fh);
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        using tdx = TDXDerivatives<decltype(model)>;
+        const Eigen::ArrayXd x = molefrac_of(sys);
+        const double T = row.T, rho = row.rho;
+        CAPTURE(row.name, row.fh, T, rho);
+        double a = model.alphar(T, rho, x), Ar01 = tdx::get_Ar01(model, T, rho, x), Ar10 = tdx::get_Ar10(model, T, rho, x);
+        double Ar20 = tdx::get_Ar20(model, T, rho, x), Ar11 = tdx::get_Ar11(model, T, rho, x), Ar02 = tdx::get_Ar02(model, T, rho, x);
+        CHECK(a == Approx(row.alphar).epsilon(1e-12));
+        CHECK(Ar01 == Approx(row.Ar01).epsilon(1e-12));
+        CHECK(Ar10 == Approx(row.Ar10).epsilon(1e-12));
+        CHECK(Ar20 == Approx(row.Ar20).epsilon(1e-9).margin(1e-14));
+        CHECK(Ar11 == Approx(row.Ar11).epsilon(1e-9).margin(1e-14));
+        CHECK(Ar02 == Approx(row.Ar02).epsilon(1e-9).margin(1e-14));
+    }
+}
+
+TEST_CASE("SAFT-VRQ Mie higher derivatives: autodiff equals multicomplex", "[SAFTVRQMie]"){
+    // Orders beyond thermopack's. Measured largest relative differences: Ar03 1.3e-14, Ar04 2.3e-15, Ar30 2.4e-14,
+    // Ar21 6.5e-14, Ar12 1.4e-13.
+    struct Row{ const char* name; int fh; double T, rho; };
+    const std::vector<Row> rows = {
+        {"He", 2, 20.0, 30000.0}, {"He-Ne x_He=0.5", 1, 30.0, 30000.0}, {"He-Ne x_He=0.5", 1, 30.0, 1000.0},
+        {"He-Ne x_He=0.5", 2, 673.0, 20000.0}, {"He-Ne x_He=0.05", 2, 673.0, 20000.0},
+    };
+    for (const auto& row : rows){
+        const auto& sys = ref_system(row.name, row.fh);
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        using tdx = TDXDerivatives<decltype(model)>;
+        const Eigen::ArrayXd x = molefrac_of(sys);
+        const double T = row.T, rho = row.rho;
+        auto cmp = [&](const std::string& k, double ad, double mcx){
+            CAPTURE(row.name, row.fh, T, rho, k, ad, mcx);
+            REQUIRE(std::isfinite(mcx));
+            CHECK(ad == Approx(mcx).epsilon(1e-12));
+        };
+        cmp("Ar03", tdx::get_Ar03(model, T, rho, x), tdx::get_Ar03<ADBackends::multicomplex>(model, T, rho, x));
+        cmp("Ar04", tdx::template get_Arxy<0, 4>(model, T, rho, x), tdx::template get_Arxy<0, 4, ADBackends::multicomplex>(model, T, rho, x));
+        cmp("Ar30", tdx::get_Ar30(model, T, rho, x), tdx::get_Ar30<ADBackends::multicomplex>(model, T, rho, x));
+        cmp("Ar21", tdx::get_Ar21(model, T, rho, x), tdx::get_Ar21<ADBackends::multicomplex>(model, T, rho, x));
+        cmp("Ar12", tdx::get_Ar12(model, T, rho, x), tdx::get_Ar12<ADBackends::multicomplex>(model, T, rho, x));
+    }
+}
+
+TEST_CASE("SAFT-VRQ Mie second virial coefficient", "[SAFTVRQMie]"){
+    // thermopack's second_virial_matrix derives B_ij from the mixture B2 at x = 0.5, assuming B2 is quadratic
+    // in x (eostv.f90:724-735). For SAFT-VRQ Mie it is not (a3 contains zeta_bar, quadratic in x), so
+    // sum_ij x_i x_j B_ij is B2 only for the pure fluids and the x = 0.5 systems. Its finite-volume evaluation
+    // carries a bias of ~1e-12 relative (EQUATIONS.md section 16). Measured largest relative difference 3.4e-11, at He FH2
+    // 20 K where B2 = -8.6e-7 m^3/mol is near zero; the absolute differences of check_spec.py's B2 from this form are <= 3.9e-15 m^3/mol.
+    for (const auto& sys : REF()["systems"]){
+        if (sys["name"] == "He-Ne x_He=0.05"){ continue; }
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        const Eigen::ArrayXd x = molefrac_of(sys);
+        for (const auto& tb : sys["temperatures"]){
+            double T = tb["T"];
+            double Bref = 0.0;
+            for (auto i = 0U; i < x.size(); ++i){ for (auto j = 0U; j < x.size(); ++j){ Bref += x[i]*x[j]*tb["B2_matrix_m3_per_mol"][i][j].get<double>(); } }
+            double B = VirialDerivatives<decltype(model)>::get_B2vir(model, T, x);
+            CAPTURE(sys["name"].get<std::string>(), sys["feynman_hibbs_order"].get<int>(), T, B, Bref);
+            CHECK(B == Approx(Bref).epsilon(1e-10));
+        }
+    }
+    // He-Ne x_He = 0.05: B2 = d alphar/d rho at rho = 0 by complex step in check_spec.py (independent of
+    // thermopack and teqp), printed by
+    //   nice -n 19 ~/codes/teqp-dev-venv/bin/python -I ~/codes/teqp-saftvrq-ref/gen_B2_x.py
+    // {FH order, T / K, B2 / (m^3/mol)}. thermopack's quadratic form is off by 3.2e-7 (FH1, 150 K) to 2.1e-3 (FH2, 5 K) here;
+    // thermopack's virial_coeffcients at x agrees with these to 4.2e-13 to 4.7e-12. Measured largest relative difference 1.3e-15.
+    struct Row{ int fh; double T, B2; };
+    const std::vector<Row> rows = {
+        {1, 5.0, -0.0013512483872102827}, {1, 20.0, -0.00014304395733464193}, {1, 30.0, -7.608807853524795e-05},
+        {1, 50.0, -3.11799364580211e-05}, {1, 150.0, 5.211696658630649e-06},
+        {2, 5.0, -0.001188172598887956}, {2, 20.0, -0.000141835248282779}, {2, 30.0, -7.599477573208429e-05},
+        {2, 50.0, -3.13503317072581e-05}, {2, 150.0, 5.085835137689868e-06},
+    };
+    for (const auto& row : rows){
+        const auto& sys = ref_system("He-Ne x_He=0.05", row.fh);
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        double B = VirialDerivatives<decltype(model)>::get_B2vir(model, row.T, molefrac_of(sys));
+        CAPTURE(row.fh, row.T, B, row.B2);
+        CHECK(B == Approx(row.B2).epsilon(1e-12));
+    }
+}
