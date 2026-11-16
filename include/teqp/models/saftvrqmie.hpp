@@ -63,7 +63,7 @@ inline PairParameters make_pair(const PureParameters& pi, const PureParameters& 
     p.Q2a = 0.5*p.la*(p.la - 1.0)*(p.la + 1.0)*(p.la + 2.0);
     p.Q2r = 0.5*p.lr*(p.lr - 1.0)*(p.lr + 1.0)*(p.lr + 2.0);
     double mu = pi.mass_kg*pj.mass_kg/(pi.mass_kg + pj.mass_kg);
-    p.Dparam = h_Js*h_Js/(96.0*mu*constants::k_B*M_PI*M_PI);
+    p.Dparam = h_Js*h_Js/(96.0*mu*constants::k_B*constants::PI*constants::PI);
     return p;
 }
 
