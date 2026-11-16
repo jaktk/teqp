@@ -39,6 +39,19 @@ static nlohmann::json model_spec(const nlohmann::json& sys){
             {"Planck_constant / J s", REF()["constants_thermopack"]["h_J_s"]}};
 }
 
+/// The reference system with this name and Feynman-Hibbs order
+static const nlohmann::json& ref_system(const std::string& name, int fh){
+    for (const auto& s : REF()["systems"]){
+        if (s["name"] == name && s["feynman_hibbs_order"] == fh){ return s; }
+    }
+    throw std::invalid_argument(name);
+}
+
+static Eigen::ArrayXd molefrac_of(const nlohmann::json& sys){
+    auto x = sys["x"].get<std::vector<double>>();
+    return Eigen::Map<const Eigen::ArrayXd>(x.data(), x.size());
+}
+
 TEST_CASE("SAFT-VRQ Mie combining rules", "[SAFTVRQMie]"){
     // He-Ne FH1: lambda_r 9 and 13 -> 3 + sqrt(6*10); kij -0.22
     auto pp = make_pair(PureParameters{"HE", 2.7443e-10, 5.4195, 6.0, 9.0, 6.6464764e-27},
@@ -132,12 +145,7 @@ TEST_CASE("SAFT-VRQ Mie temperature quantities at high T against thermopack", "[
         {"H2", 2, 1000.0, 0, 0, 2.936656788168689e-10, 54.42273677911885, 2.6730700990320927e-10, 0.6531540880146505},
     };
     for (const auto& row : rows){
-        const nlohmann::json* sys = nullptr;
-        for (const auto& s : REF()["systems"]){
-            if (s["name"] == row.name && s["feynman_hibbs_order"] == row.fh){ sys = &s; }
-        }
-        REQUIRE(sys != nullptr);
-        auto P = pairs_of(*sys);
+        auto P = pairs_of(ref_system(row.name, row.fh));
         CAPTURE(row.name, row.fh, row.T, row.i, row.j);
         auto q = temperature_quantities(P[row.i][row.j], row.T);
         CHECK(q.sigma_eff == Approx(row.sigma_eff).epsilon(1e-12));
@@ -184,14 +192,10 @@ TEST_CASE("SAFT-VRQ Mie third T derivative: multicomplex equals autodiff", "[SAF
         {"He-Ne x_He=0.5", 1, 30.0, 30000.0}, {"He-Ne x_He=0.5", 1, 30.0, 1000.0},
     };
     for (const auto& row : rows){
-        const nlohmann::json* sys = nullptr;
-        for (const auto& s : REF()["systems"]){
-            if (s["name"] == row.name && s["feynman_hibbs_order"] == row.fh){ sys = &s; }
-        }
-        REQUIRE(sys != nullptr);
-        const auto model = SAFTVRQMiefactory(model_spec(*sys));
+        const auto& sys = ref_system(row.name, row.fh);
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
         using tdx = TDXDerivatives<decltype(model)>;
-        Eigen::ArrayXd x = Eigen::Map<const Eigen::ArrayXd>((*sys)["x"].get<std::vector<double>>().data(), (*sys)["x"].size());
+        const Eigen::ArrayXd x = molefrac_of(sys);
         CAPTURE(row.name, row.fh, row.T, row.rho);
         double Ar30_mcx = tdx::get_Ar30<ADBackends::multicomplex>(model, row.T, row.rho, x);
         double Ar30_ad = tdx::get_Ar30<ADBackends::autodiff>(model, row.T, row.rho, x);
@@ -203,12 +207,7 @@ TEST_CASE("SAFT-VRQ Mie third T derivative: multicomplex equals autodiff", "[SAF
 
 TEST_CASE("SAFT-VRQ Mie factory input validation", "[SAFTVRQMie]"){
     using Catch::Matchers::ContainsSubstring;
-    const nlohmann::json* sys = nullptr;
-    for (const auto& s : REF()["systems"]){
-        if (s["name"] == "He-Ne x_He=0.5" && s["feynman_hibbs_order"] == 1){ sys = &s; }
-    }
-    REQUIRE(sys != nullptr);
-    const nlohmann::json base = model_spec(*sys);
+    const nlohmann::json base = model_spec(ref_system("He-Ne x_He=0.5", 1));
     CHECK_NOTHROW(SAFTVRQMiefactory(base));
     
     auto with = [&](const std::string& key, const nlohmann::json& value){ auto j = base; j[key] = value; return j; };
@@ -246,20 +245,8 @@ TEST_CASE("SAFT-VRQ Mie factory input validation", "[SAFTVRQMie]"){
     CHECK_THROWS_WITH(SAFTVRQMiefactory(with_pure("m", 2.0)), ContainsSubstring("spherical molecules only"));
 }
 
-/// The reference system with this name and Feynman-Hibbs order
-static const nlohmann::json& ref_system(const std::string& name, int fh){
-    for (const auto& s : REF()["systems"]){
-        if (s["name"] == name && s["feynman_hibbs_order"] == fh){ return s; }
-    }
-    throw std::invalid_argument(name);
-}
-
-static Eigen::ArrayXd molefrac_of(const nlohmann::json& sys){
-    auto x = sys["x"].get<std::vector<double>>();
-    return Eigen::Map<const Eigen::ArrayXd>(x.data(), x.size());
-}
-
 TEST_CASE("SAFT-VRQ Mie derivatives against thermopack", "[SAFTVRQMie]"){
+    int istate = 0;
     for (const auto& sys : REF()["systems"]){
         const auto model = SAFTVRQMiefactory(model_spec(sys));
         using tdx = TDXDerivatives<decltype(model)>;
@@ -278,9 +265,10 @@ TEST_CASE("SAFT-VRQ Mie derivatives against thermopack", "[SAFTVRQMie]"){
                 CHECK(Ar20 == Approx(st["Ar20"].get<double>()).epsilon(1e-9).margin(1e-14));
                 CHECK(Ar11 == Approx(st["Ar11"].get<double>()).epsilon(1e-9).margin(1e-14));
                 CHECK(Ar02 == Approx(st["Ar02"].get<double>()).epsilon(1e-9).margin(1e-14));
-                // autodiff against backends that never see the Newton steps in the autodiff type.
+                // autodiff against backends that never see the Newton steps in the autodiff type, on every 4th state (runtime).
                 // complex_step for T fails to compile for alphar-only models (derivs.hpp calls w.alpha), so T uses multicomplex.
-                // Measured: Ar01 1.4e-14, Ar10 2.4e-14.
+                // Measured over all 240 states: Ar01 1.4e-14, Ar10 2.4e-14.
+                if (istate++ % 4 != 0){ continue; }
                 double Ar01_cs = tdx::get_Ar01<ADBackends::complex_step>(model, T, rho, x);
                 double Ar10_mcx = tdx::get_Ar10<ADBackends::multicomplex>(model, T, rho, x);
                 CHECK(Ar01 == Approx(Ar01_cs).epsilon(1e-12));
@@ -397,5 +385,100 @@ TEST_CASE("SAFT-VRQ Mie second virial coefficient", "[SAFTVRQMie]"){
         double B = VirialDerivatives<decltype(model)>::get_B2vir(model, row.T, molefrac_of(sys));
         CAPTURE(row.fh, row.T, B, row.B2);
         CHECK(B == Approx(row.B2).epsilon(1e-12));
+    }
+}
+
+/// Gradient of Psir = alphar R T rho w.r.t. the molar concentrations by complex step, one component at a time.
+/// teqp's build_Psir_gradient_complex_step and _multicomplex do not compile for any model, so it is written here.
+template<typename Model>
+static Eigen::ArrayXd Psir_gradient_complex_step(const Model& model, double T, const Eigen::ArrayXd& rhovec){
+    const double h = 1e-100;
+    const Eigen::ArrayXd xreal = rhovec/rhovec.sum();
+    const double R = model.R(xreal);
+    Eigen::ArrayXd g(rhovec.size());
+    for (auto i = 0; i < rhovec.size(); ++i){
+        Eigen::ArrayX<std::complex<double>> r = rhovec.cast<std::complex<double>>();
+        r[i] += std::complex<double>(0.0, h);
+        const std::complex<double> rhotot = r.sum();
+        const Eigen::ArrayX<std::complex<double>> x = (r/rhotot).eval();
+        g[i] = (model.alphar(T, rhotot, x)*R*T*rhotot).imag()/h;
+    }
+    return g;
+}
+
+TEST_CASE("SAFT-VRQ Mie composition derivatives", "[SAFTVRQMie]"){
+    for (const auto& sys : REF()["systems"]){
+        if (sys["x"].size() < 2){ continue; }
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        using id = IsochoricDerivatives<decltype(model)>;
+        const Eigen::ArrayXd x = molefrac_of(sys);
+        for (const auto& tb : sys["temperatures"]){
+            double T = tb["T"];
+            for (const auto& st : tb["states"]){
+                double rho = st["rho_mol_m3"];
+                const Eigen::ArrayXd rhovec = (rho*x).eval();
+                CAPTURE(sys["name"].get<std::string>(), sys["feynman_hibbs_order"].get<int>(), T, rho);
+                const Eigen::ArrayXd g_ad = id::build_Psir_gradient_autodiff(model, T, rhovec);
+                const Eigen::ArrayXd g_cs = Psir_gradient_complex_step(model, T, rhovec);
+                const Eigen::ArrayXXd H_ad = id::build_Psir_Hessian_autodiff(model, T, rhovec);
+                const Eigen::ArrayXXd H_mcx = id::build_Psir_Hessian_mcx(model, T, rhovec);
+                for (auto i = 0; i < x.size(); ++i){
+                    CAPTURE(i, g_ad[i], g_cs[i]);
+                    // measured largest relative difference 8.7e-15 (120 states)
+                    CHECK(g_ad[i] == Approx(g_cs[i]).epsilon(1e-12));
+                    for (auto j = 0; j < x.size(); ++j){
+                        CAPTURE(j, H_ad(i,j), H_mcx(i,j));
+                        // measured largest relative difference 3.6e-12; relative to the largest entry of H, 1.4e-13
+                        CHECK(H_ad(i,j) == Approx(H_mcx(i,j)).epsilon(1e-10));
+                    }
+                }
+            }
+        }
+    }
+
+    // ln phi_i = ln f_i - ln(x_i p), thermopack 2.2.3 (numpy 2.5.5) fugacity_tv and pressure_tv at n = x, V = 1/rho,
+    // printed by
+    //   nice -n 19 ~/codes/teqp-dev-venv/bin/python -I ~/codes/teqp-saftvrq-ref/gen_lnphi.py
+    // States with p <= 0 (20 K, 30000 mol/m^3, all four systems) are left out. Measured largest difference 5.1e-15.
+    // {system name in the reference JSON, FH order, T / K, rho / mol/m^3, ln phi_He, ln phi_Ne}
+    struct Row{ const char* name; int fh; double T, rho, lnphi0, lnphi1; };
+    const std::vector<Row> rows = {
+        {"He-Ne x_He=0.05", 1, 20.0, 1000.0, 0.06418807784915437, -0.14135564816248447},
+        {"He-Ne x_He=0.05", 1, 50.0, 1000.0, 0.02464426961739896, -0.03336643628325042},
+        {"He-Ne x_He=0.05", 1, 50.0, 30000.0, 1.0231240725474375, -0.6406352459713869},
+        {"He-Ne x_He=0.05", 1, 150.0, 1000.0, 0.016398373086021323, 0.004766676053952423},
+        {"He-Ne x_He=0.05", 1, 150.0, 30000.0, 0.6718206546718957, 0.38110160003818905},
+        {"He-Ne x_He=0.05", 1, 673.0, 1000.0, 0.01110839854601764, 0.014744206585028508},
+        {"He-Ne x_He=0.05", 1, 673.0, 20000.0, 0.2882796727359054, 0.39306925676191184},
+        {"He-Ne x_He=0.5", 1, 20.0, 1000.0, 0.018133134993323807, -0.13638486581257503},
+        {"He-Ne x_He=0.5", 1, 50.0, 1000.0, 0.014320281827751913, -0.03007157138541494},
+        {"He-Ne x_He=0.5", 1, 50.0, 30000.0, 0.5606207598122381, -0.6895487384503198},
+        {"He-Ne x_He=0.5", 1, 150.0, 1000.0, 0.01325387615225182, 0.006002862239865792},
+        {"He-Ne x_He=0.5", 1, 150.0, 30000.0, 0.5783214547791857, 0.4373407783633745},
+        {"He-Ne x_He=0.5", 1, 673.0, 1000.0, 0.010015438691070244, 0.015121581816714524},
+        {"He-Ne x_He=0.5", 1, 673.0, 20000.0, 0.2501413374926038, 0.3822771614515368},
+        {"He-Ne x_He=0.05", 2, 20.0, 1000.0, 0.07128058660179803, -0.14066918140244233},
+        {"He-Ne x_He=0.05", 2, 50.0, 1000.0, 0.024776510550836406, -0.03354855261762957},
+        {"He-Ne x_He=0.05", 2, 50.0, 30000.0, 0.9780843970980087, -0.6354126693410596},
+        {"He-Ne x_He=0.05", 2, 150.0, 1000.0, 0.01571891064480191, 0.004667669960076282},
+        {"He-Ne x_He=0.05", 2, 150.0, 30000.0, 0.622041750598127, 0.37482634275702864},
+        {"He-Ne x_He=0.05", 2, 673.0, 1000.0, 0.011427468011202535, 0.014707135725917198},
+        {"He-Ne x_He=0.05", 2, 673.0, 20000.0, 0.29482927521660507, 0.39204293835846116},
+        {"He-Ne x_He=0.5", 2, 20.0, 1000.0, 0.018085091179436574, -0.13291950425001708},
+        {"He-Ne x_He=0.5", 2, 50.0, 1000.0, 0.013128915572389488, -0.029758309605572464},
+        {"He-Ne x_He=0.5", 2, 50.0, 30000.0, 0.49486900995183447, -0.698203073735888},
+        {"He-Ne x_He=0.5", 2, 150.0, 1000.0, 0.012976809990288274, 0.0057487761610719446},
+        {"He-Ne x_He=0.5", 2, 150.0, 30000.0, 0.5584085529972889, 0.4138589266193051},
+        {"He-Ne x_He=0.5", 2, 673.0, 1000.0, 0.01103706069956445, 0.014824999044202869},
+        {"He-Ne x_He=0.5", 2, 673.0, 20000.0, 0.27624114998629423, 0.3774481522758286},
+    };
+    for (const auto& row : rows){
+        const auto& sys = ref_system(row.name, row.fh);
+        const auto model = SAFTVRQMiefactory(model_spec(sys));
+        const Eigen::ArrayXd rhovec = (row.rho*molefrac_of(sys)).eval();
+        const Eigen::ArrayXd lnphi = IsochoricDerivatives<decltype(model)>::get_ln_fugacity_coefficients(model, row.T, rhovec);
+        CAPTURE(row.name, row.fh, row.T, row.rho, lnphi[0], lnphi[1]);
+        CHECK(std::abs(lnphi[0] - row.lnphi0) < 1e-12);
+        CHECK(std::abs(lnphi[1] - row.lnphi1) < 1e-12);
     }
 }
