@@ -118,6 +118,32 @@ TEST_CASE("multifluid-excess: invalid specifications raise", "[multifluid-excess
                          Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("components")));
 }
 
+TEST_CASE("multifluid-excess: polar SAFT-VR Mie input raises instead of being dropped", "[multifluid-excess]"){
+    auto coeffs_spec = [](const nlohmann::json& extra){
+        auto spec = hybrid_spec();
+        nlohmann::json c0 = {{"name", "Methane"}, {"m", 1.0}, {"sigma_m", 3.7412e-10}, {"epsilon_over_k", 153.36},
+                             {"lambda_r", 12.650}, {"lambda_a", 6.0}, {"BibTeXKey", "Lafitte-JCP-2001"}};
+        nlohmann::json c1 = {{"name", "Ethane"}, {"m", 1.4373}, {"sigma_m", 3.7257e-10}, {"epsilon_over_k", 206.12},
+                             {"lambda_r", 12.400}, {"lambda_a", 6.0}, {"BibTeXKey", "Lafitte-JCP-2001"}};
+        c1.update(extra);
+        spec["excess"]["model"] = {{"coeffs", {c0, c1}}};
+        return spec;
+    };
+    // the same fluids given by coefficients build, and give the excess of the "names" form
+    const MultifluidPlusExcess by_names(hybrid_spec()), by_coeffs(coeffs_spec(nlohmann::json::object()));
+    Eigen::ArrayXd z(2); z << 0.3, 0.7;
+    CHECK(by_coeffs.alphar_excess(250.0, 5000.0, z) == by_names.alphar_excess(250.0, 5000.0, z));
+    for (const auto& extra : {nlohmann::json{{"mu_D", 1.0}}, nlohmann::json{{"Q_DA", 1.0}},
+                              nlohmann::json{{"(mu^*)^2", 0.5}, {"nmu", 1.0}}, nlohmann::json{{"Q_Cm2", 1e-40}}}){
+        CAPTURE(extra.dump());
+        CHECK_THROWS_MATCHES(MultifluidPlusExcess(coeffs_spec(extra)), teqp::InvalidArgument,
+                             Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("nonpolar")));
+    }
+    auto with_polar_model = hybrid_spec(); with_polar_model["excess"]["model"]["polar_model"] = "GrossVrabec";
+    CHECK_THROWS_MATCHES(MultifluidPlusExcess(with_polar_model), teqp::InvalidArgument,
+                         Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("nonpolar")));
+}
+
 TEST_CASE("multifluid-excess: a VLE isotherm traces from the pure-fluid saturation state", "[multifluid-excess]"){
     auto am = cppinterface::make_model({{"kind", "multifluid-excess"}, {"model", hybrid_spec()}});
     auto mf = cppinterface::make_model({{"kind", "multifluid"}, {"model", hybrid_spec().at("multifluid")}});
