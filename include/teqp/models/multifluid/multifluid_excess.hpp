@@ -31,20 +31,45 @@ namespace teqp::multifluid::multifluid_excess {
  "SAFT-VR-Mie" model block>}}. The constructor checks that both blocks have the same number of
  components; the caller must give the components in the same order in both blocks (multifluid
  component entries may be file paths or JSON, so names cannot be compared in general).
+ 
+ The excess model is the nonpolar SAFT-VR Mie (monomer and chain terms). A SAFT-VR Mie block with
+ dipole or quadrupole moments, or with polar options, raises: carrying the polar terms through every
+ derivative type the interface instantiates doubles the compile time and memory of this model.
  */
 class MultifluidPlusExcess{
 public:
     using multifluid_t = decltype(multifluidfactory(nlohmann::json{}));
-    using excess_t = SAFTVRMie::SAFTVRMieMixture;
+    using excess_t = SAFTVRMie::SAFTVRMieNonpolarMixture;
 private:
     const multifluid_t m_multifluid;
     const excess_t m_excess;
+    
+    /// Raise if a SAFT-VR Mie block asks for polar terms; SAFTVRMieNonpolarfactory would ignore them
+    static void require_nonpolar(const nlohmann::json& model){
+        for (const auto* key : {"polar_model", "polar_flags"}){
+            if (model.contains(key)){
+                throw teqp::InvalidArgument(std::string("multifluid-excess: the SAFT-VR Mie excess model is nonpolar; remove \"") + key + "\"");
+            }
+        }
+        if (!model.contains("coeffs")){
+            return; // "names" are looked up in SAFTVRMieLibrary, which holds nonpolar fluids only
+        }
+        for (const auto& c : model.at("coeffs")){
+            for (const auto* key : {"(mu^*)^2", "nmu", "mu_Cm", "mu_D", "(Q^*)^2", "nQ", "Q_Cm2", "Q_DA"}){
+                if (c.contains(key)){
+                    throw teqp::InvalidArgument(std::string("multifluid-excess: the SAFT-VR Mie excess model is nonpolar; component ")
+                        + c.value("name", std::string("?")) + " has \"" + key + "\"");
+                }
+            }
+        }
+    }
     
     static excess_t build_excess(const nlohmann::json& spec){
         if (spec.at("kind") != "SAFT-VR-Mie"){
             throw teqp::InvalidArgument("multifluid-excess: the excess model must be of kind SAFT-VR-Mie, got " + spec.at("kind").dump());
         }
-        return SAFTVRMie::SAFTVRMiefactory(spec.at("model"));
+        require_nonpolar(spec.at("model"));
+        return SAFTVRMie::SAFTVRMieNonpolarfactory(spec.at("model"));
     }
 public:
     MultifluidPlusExcess(const nlohmann::json& spec) :
